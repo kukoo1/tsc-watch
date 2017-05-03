@@ -3,6 +3,10 @@
 
 const chalk = require('chalk');
 const spawn = require('cross-spawn');
+const fs = require('fs');
+const path = require('path');
+const exec = require('child_process').exec;
+const chokidar = require('chokidar');
 
 const compilationStartedRegex = /Starting incremental compilation/;
 const compilationCompleteRegex = / Compilation complete\. Watching for file changes\./;
@@ -68,28 +72,121 @@ function killAllProcesses() {
     successProcess = null;
   }
 }
+
+function getArg(argName, allArgs, isTscParam = true)
+{
+    let Idx = getCommandIdx(allArgs, argName);
+    let arg = null;
+    if (Idx > -1) {
+        arg = allArgs[Idx + 1];
+        if (!isTscParam)
+            allArgs.splice(Idx, 2)
+    }
+    return arg;
+}
+
+function getProjectDir() {
+  return getArg('--project', allArgs) || getArg('-p', allArgs) || process.cwd();
+}
+
+function readTsConfig(tsconfig)
+{
+    let lsstat = fs.lstatSync(tsconfig);
+    if (lsstat.isDirectory())
+    {
+        let trimmed = tsconfig.slice(-1) == '/' ? tsconfig.slice(0,-1) : tsconfig; //  trim tail '/'
+        tsconfig = trimmed + '/tsconfig.json';
+    }
+    return eval('(' + fs.readFileSync(tsconfig, 'utf8') + ')');  //eval allows c-style comment in tsconfig.json
+}
+
+function getIncludeFromTsConfig(config)
+{
+    let include = [];
+    if (config.files)
+        include = include.concat(config.files);
+    if (config.include)
+        include = include.concat(config.include);
+    return include;
+}
+function getExcludeFromTsConfig(config)
+{
+    let exclude = [];
+    if (config.exclude)
+        exclude = config.exclude;
+    return exclude;
+}
+function getRootDirFromTsConfig(config)
+{
+    let rootDir = null;
+    if (config.compilerOptions && config.compilerOptions.rootDir)
+        rootDir = config.compilerOptions.rootDir;
+    return rootDir;
+}
+function getOutDirFromTsConfig(config)
+{
+    let outDir = null;
+    if (config.compilerOptions && config.compilerOptions.outDir)
+        outDir = config.compilerOptions.outDir;
+    return outDir;
+}
+
+function watchForDelete(rootDir, outDir, include, exclude) {
+    let resolveDest = (file) => path.resolve(outDir, path.relative(rootDir, file));
+
+    chokidar.watch(include, {ignored: exclude})
+        .on('unlink', filePath => {
+            filePath = resolveDest(filePath).slice(0, -2) + 'js';
+            if (fs.existsSync(filePath)) {
+                fs.unlink(filePath, (err) => {
+                    console.log('Cannot remove ' + filePath + ' : ' + err);
+                });
+            }
+        })
+        .on('unlinkDir', dirPath => {
+            dirPath = resolveDest( path.relative(getProjectDir(), dirPath) );
+            let child = exec('rm -rf ' + dirPath);
+            child.addListener('exit', () => {exec('rmdir -rf ' + dirPath)});
+        })
+        .on('error', err => {
+            console.log('Error watching for deleted/renamed/moved file ' + err);
+        });
+}
+
+//////////////////////////////////////
+
 let allArgs = process.argv;
 // onSuccess
-let onSuccessCommandIdx = getCommandIdx(allArgs, '--onSuccess');
-let onSuccessCommand = null;
-if (onSuccessCommandIdx > -1) {
-  onSuccessCommand = allArgs[onSuccessCommandIdx + 1];
-  allArgs.splice(onSuccessCommandIdx, 2)
-}
 
-// onFirstSuccess
-let onFirstSuccessCommandIdx = getCommandIdx(allArgs, '--onFirstSuccess');
-let onFirstSuccessCommand = null;
-if (onFirstSuccessCommandIdx > -1) {
-  onFirstSuccessCommand = allArgs[onFirstSuccessCommandIdx + 1];
-  allArgs.splice(onFirstSuccessCommandIdx, 2)
-}
+let onSuccessCommand= getArg('--onSuccess', allArgs, false);
+let onFirstSuccessCommand = getArg('--onFirstSuccess', allArgs, false);
+let rootDir = getArg('--rootDir', allArgs);
+let outDir = getArg('--outDir', allArgs);
 
-let args = cleanArgs(allArgs);
-args.push('--watch'); // force watch
+allArgs = cleanArgs(allArgs);
+allArgs.push('--watch'); // force watch
 
 const bin = require.resolve('typescript/bin/tsc');
-const tscProcess = spawn(bin, [...args]);
+const tscProcess = spawn(bin, [...allArgs]);
+
+let projectDir = getProjectDir();
+let include, exclude;
+try {
+    let tsconfig = readTsConfig(projectDir);
+    include = getIncludeFromTsConfig(tsconfig);
+    exclude = getExcludeFromTsConfig(tsconfig);
+    if (!rootDir)
+        rootDir = getRootDirFromTsConfig(tsconfig);
+    if (!outDir)
+        outDir = getOutDirFromTsConfig(tsconfig);
+} catch(err){
+    console.log('Warning: cannot locate tsconfig.json in ' + projectDir + ' OR tsconfig.json is not valid json.\n' + err);
+}
+
+if (include && rootDir && outDir)
+    watchForDelete(rootDir, outDir, include, exclude);
+else
+    console.log('Autodelete is disabled: You have to specify "include" in tsconfig.json, either ["rootDir", "outDir" in tsconfig.json] or [arguments --rootDir, --outDir] in order to enable autodelete.');
 
 tscProcess.stdout.on('data', buffer => {
   const lines = buffer.toString()
